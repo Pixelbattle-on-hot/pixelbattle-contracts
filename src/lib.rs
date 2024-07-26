@@ -1,29 +1,51 @@
-// Find all our documentation at https://docs.near.org
-use near_sdk::{log, near};
-use near_sdk::{store::UnorderedMap};
+use std::u128;
+
+use near_sdk::borsh::{self, BorshDeserialize};
+use near_sdk::serde::{self, Serialize};
+use near_sdk::store::{LookupMap, LookupSet, UnorderedMap};
+use near_sdk::{env, near, BorshStorageKey, NearSchema, Promise};
 use near_sdk::{NearToken, AccountId, borsh::BorshSerialize};
 
+const FIELD_WIDTH: u32 = 100;
+const FIELD_HEIGHT: u32 = 100;
+const PIXEL_START_PRICE: NearToken = NearToken::from_millinear(1);
+const PIXEL_PRICE_INCREASE: u32 = 2;
+const GAME_PERIOD: u64 = 300_000;
 
-// Define the contract structure
+#[derive(BorshSerialize, BorshStorageKey)]
+#[borsh(crate = "borsh")]
+enum StorageKey {
+    FieldRow { row_id: u32 },
+    Field,
+    AccountCells,
+    AccountWithdraw,
+}
+
 #[near(contract_state)]
 pub struct Contract {
     field: UnorderedMap<u32, UnorderedMap<u32, PixelInfo>>,
+    account_cells: LookupMap<AccountId, u32>,
+    account_withdraw: LookupSet<AccountId>,
+    start_timestamp: u64,
+    reward_dist_balance: u128,
 }
-
-// Define the default, which automatically initializes the contract
-
-// Implement the contract structure
-
 
 impl Default for Contract {
     fn default() -> Self {
         Self {
-            field: UnorderedMap::new(b"b"),
+            field: UnorderedMap::new(StorageKey::Field),
+            account_cells: LookupMap::new(StorageKey::AccountCells),
+            account_withdraw: LookupSet::new(StorageKey::AccountWithdraw),
+            start_timestamp: env::block_timestamp_ms(),
+            reward_dist_balance: env::account_balance().as_yoctonear(),
         }
     }
 }
 
-#[derive(BorshSerialize)]
+#[derive(BorshSerialize, BorshDeserialize, Clone, NearSchema)]
+#[borsh(crate = "borsh")]
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
 struct PixelInfo {
     owner: AccountId,
     price: NearToken,
@@ -32,10 +54,6 @@ struct PixelInfo {
 
 #[near]
 impl Contract {
-    // Public method - returns the greeting saved, defaulting to DEFAULT_GREETING
-    const PIXEL_START_PRICE: u32 = 1;
-    const PIXEL_PRICE_INCREASE: u32 = 2;
-
     // set pixel
     // get pixel
     // get field row 
@@ -48,21 +66,109 @@ impl Contract {
     #[private] // only callable by the contract's account
     pub fn init() -> Self {
         Self {
-            field: UnorderedMap::new(b"b"),
+            field: UnorderedMap::new(StorageKey::Field),
+            account_cells: LookupMap::new(StorageKey::AccountCells),
+            account_withdraw: LookupSet::new(StorageKey::AccountWithdraw),
+            start_timestamp: env::block_timestamp_ms(),
+            reward_dist_balance: env::account_balance().as_yoctonear(),
         }
     }
+
+    pub fn get_pixel(&self, position_x: u32, position_y: u32) -> PixelInfo {
+        self.field
+            .get(&position_y)
+            .expect("Position y not found")
+            .get(&position_x)
+            .expect("Position x not found")
+            .clone()
+    }
+
+    pub fn get_field_row(&self, position_y: u32) -> Vec<PixelInfo> {
+        self.field
+            .get(&position_y)
+            .expect("Position y not found")
+            .values()
+            .map(|pixel| pixel.clone())
+            .collect()
+    }
+
+    pub fn is_game_finished(&self) -> bool {
+        return if self.start_timestamp + GAME_PERIOD > env::block_timestamp_ms() {
+            false
+        } else {
+            true
+        };
+    }
+
     #[payable]
     pub fn set_pixel(&mut self, color: u32, position_x: u32, position_y: u32) {
-        let mut row = self.field.get(position_x).unwrap_or(UnorderedMap::new(position_x));
-        let mut pixelInfo = row.get(position_y).unwrap_or(PixelInfo{owner: env::predecessor_account_id(), price: PIXEL_START_PRICE, color: 0});
-        if env::attached_deposit() < pixelInfo.price * PIXEL_PRICE_INCREASE {
+        if self.is_game_finished() {
+            panic!("The game is already finished")
+        }
+
+        if FIELD_HEIGHT < position_y || FIELD_WIDTH < position_x {
+            panic!("Incorect coordinates");
+        }
+
+        let row = if let Some(row) = self.field.get_mut(&position_y) {
+            row
+        } else {
+            let new_row = UnorderedMap::new(StorageKey::FieldRow { row_id: position_y });
+            self.field.insert(position_y, new_row);
+            self.field.get_mut(&position_y).unwrap()
+        };
+
+        let mut d_cell = 1;
+        let pixel_info = if let Some(pixel_info) = row.get_mut(&position_x) {
+            pixel_info
+        } else {
+            let new_pixel = PixelInfo {owner: env::predecessor_account_id(), price: PIXEL_START_PRICE, color: 0};
+            row.insert(position_x, new_pixel);
+            d_cell = 0;
+            row.get_mut(&position_x).unwrap()
+        };
+
+        let new_price = pixel_info.price.as_yoctonear() * PIXEL_PRICE_INCREASE as u128; 
+        let attached_deposit = env::attached_deposit().as_yoctonear();
+        if attached_deposit < new_price {
             panic!("Not enough tokens attached");
         }
-        pixelInfo.owner = env::predecessor_account_id();
-        pixelInfo.price = pixelInfo.price * PIXEL_PRICE_INCREASE;
-        pixelInfo.color = color;
 
-        row.insert(position_y, pixelInfo);
-        self.field.insert(position_x, row);
+        let mut prev_number_of_cells = self.account_cells.get(&pixel_info.owner).unwrap_or(&0).clone();
+        prev_number_of_cells -= d_cell;
+        self.account_cells.insert(pixel_info.owner.clone(), prev_number_of_cells);
+
+        pixel_info.owner = env::predecessor_account_id();
+        pixel_info.price = NearToken::from_yoctonear(new_price);
+        pixel_info.color = color;
+
+        let mut number_of_cells = self.account_cells.get(&pixel_info.owner).unwrap_or(&0).clone();
+        number_of_cells += 1;
+        self.account_cells.insert(pixel_info.owner.clone(), number_of_cells);
+
+        self.reward_dist_balance = env::account_balance().as_yoctonear();
+    }
+
+    pub fn withdraw(&mut self) {
+        if !self.is_game_finished() {
+            panic!("The game is still going on");
+        }
+        
+        let account_id = env::predecessor_account_id();
+
+        if self.account_withdraw.contains(&account_id) {
+            panic!("You have already withdrawn the money");
+        }
+
+        let number_of_user_cells = self.account_cells.get(&account_id).unwrap_or(&0).clone();
+        let contract_balance = self.reward_dist_balance;
+
+        let user_reward = (contract_balance * number_of_user_cells as u128) / (2 * (FIELD_HEIGHT * FIELD_WIDTH)) as u128;
+
+        self.account_withdraw.insert(account_id.clone());
+
+        let near_reward = NearToken::from_yoctonear(user_reward);
+
+        Promise::new(account_id).transfer(near_reward);
     }
 }
