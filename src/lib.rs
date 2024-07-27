@@ -27,6 +27,7 @@ pub struct Contract {
     account_cells: LookupMap<AccountId, u32>,
     account_withdraw: LookupSet<AccountId>,
     start_timestamp: u64,
+    last_change_block_height: u64,
     reward_dist_balance: u128,
 }
 
@@ -38,6 +39,7 @@ impl Default for Contract {
             account_withdraw: LookupSet::new(StorageKey::AccountWithdraw),
             start_timestamp: env::block_timestamp_ms(),
             reward_dist_balance: env::account_balance().as_yoctonear(),
+            last_change_block_height: env::block_height(),
         }
     }
 }
@@ -49,19 +51,13 @@ impl Default for Contract {
 struct PixelInfo {
     owner: AccountId,
     price: NearToken,
-    color: u32
+    color: u32,
+    position_x: u32,
+    position_y: u32,
 }
 
 #[near]
 impl Contract {
-    // set pixel
-    // get pixel
-    // get field row 
-    // withdraw logic
-
-    // store *active* owners
-    // price increase 
-
     #[init]
     #[private] // only callable by the contract's account
     pub fn init() -> Self {
@@ -71,33 +67,41 @@ impl Contract {
             account_withdraw: LookupSet::new(StorageKey::AccountWithdraw),
             start_timestamp: env::block_timestamp_ms(),
             reward_dist_balance: env::account_balance().as_yoctonear(),
+            last_change_block_height: env::block_height(),
         }
     }
 
-    pub fn get_pixel(&self, position_x: u32, position_y: u32) -> PixelInfo {
-        self.field
-            .get(&position_y)
-            .expect("Position y not found")
-            .get(&position_x)
-            .expect("Position x not found")
-            .clone()
+    pub fn number_of_blocks_unchanged(&self) -> u64 {
+        env::block_height() - self.last_change_block_height
+    }
+
+    pub fn get_pixel(&self, position_x: u32, position_y: u32) -> Option<PixelInfo> {
+        return if let Some(row) = self.field.get(&position_y) {
+            row.get(&position_x).map(|p| p.clone())
+        } else {
+            None
+        };
     }
 
     pub fn get_field_row(&self, position_y: u32) -> Vec<PixelInfo> {
         self.field
             .get(&position_y)
-            .expect("Position y not found")
+            .unwrap_or(&UnorderedMap::new(b"b"))
             .values()
             .map(|pixel| pixel.clone())
             .collect()
     }
 
     pub fn is_game_finished(&self) -> bool {
-        return if self.start_timestamp + GAME_PERIOD > env::block_timestamp_ms() {
+        return if self.game_finish_timestamp() > env::block_timestamp_ms() {
             false
         } else {
             true
         };
+    }
+
+    pub fn game_finish_timestamp(&self) -> u64 {
+        self.start_timestamp + GAME_PERIOD
     }
 
     #[payable]
@@ -122,7 +126,7 @@ impl Contract {
         let pixel_info = if let Some(pixel_info) = row.get_mut(&position_x) {
             pixel_info
         } else {
-            let new_pixel = PixelInfo {owner: env::predecessor_account_id(), price: PIXEL_START_PRICE, color: 0};
+            let new_pixel = PixelInfo {owner:env::predecessor_account_id(),price:PIXEL_START_PRICE,color:0, position_x, position_y };
             row.insert(position_x, new_pixel);
             d_cell = 0;
             row.get_mut(&position_x).unwrap()
@@ -147,6 +151,7 @@ impl Contract {
         self.account_cells.insert(pixel_info.owner.clone(), number_of_cells);
 
         self.reward_dist_balance = env::account_balance().as_yoctonear();
+        self.last_change_block_height = env::block_height();
     }
 
     pub fn withdraw(&mut self) {
